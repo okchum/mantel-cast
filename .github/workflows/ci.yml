@@ -27,7 +27,7 @@ jobs:
           path: mantel
       # go.mod's "go" line is the oldest Go the module builds with, not the
       # one to test, scan and release with: use the current supported release.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           check-latest: true
