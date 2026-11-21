@@ -16,12 +16,12 @@ jobs:
       run:
         working-directory: mantel-cast
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           path: mantel-cast
       # Mantel next to this repo, for the test that checks mantelKeys against
       # Mantel's Config (it fails instead of skipping when CI is set).
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           repository: okchum/mantel
           path: mantel
