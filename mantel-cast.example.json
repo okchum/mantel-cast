@@ -1,0 +1,12 @@
+{
+  "mantel": "https://mantel.example.com/",
+  "token": "$MANTEL_TOKEN",
+  "timezone": "Pacific/Auckland",
+  "cast": {
+    "device": "Nest Hub Max",
+    "check_interval": "30s",
+    "take_over": false,
+    "quiet": "auto",
+    "quiet_hours": "23:30-07:00"
+  }
+}

@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: mantel-cast
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: mantel-cast
+      # Mantel next to this repo, for the test that checks mantelKeys against
+      # Mantel's Config (it fails instead of skipping when CI is set).
+      - uses: actions/checkout@v4
+        with:
+          repository: okchum/mantel
+          path: mantel
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: mantel-cast/go.mod
+          cache-dependency-path: mantel-cast/go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -race ./...
+      - name: build (all release platforms)
+        run: make dist
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          # Pinned: a new release adds checks and would fail unchanged code.
+          version: v2.15.0
+          working-directory: mantel-cast
+      # Unpinned on purpose: the vulnerability database changes daily.
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
