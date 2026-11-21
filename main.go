@@ -1,5 +1,6 @@
-// Mantel Cast keeps a Google Nest Hub (or another Cast device, or a tablet
-// running Fully Kiosk Browser) showing a Mantel dashboard. Cast only works
+// Mantel Cast keeps a Google Nest Hub (or another Cast device, a tablet
+// running Fully Kiosk Browser, or a browser Home Assistant controls through
+// browser_mod) showing a Mantel dashboard. Cast only works
 // inside the LAN, so Mantel Cast runs at home even when Mantel lives on a public
 // server: it re-casts when the device drops back to its idle screen, stays
 // out of the way while something else plays, and goes quiet at night.
@@ -30,19 +31,19 @@ import (
 
 var version = "dev"
 
-const usage = `mantel-cast %s — keeps a Google Nest Hub (or a Fully Kiosk tablet) on your Mantel dashboard
+const usage = `mantel-cast %s — keeps a Google Nest Hub (Fully Kiosk tablet, Home Assistant browser) on your Mantel dashboard
 
 Usage:
   mantel-cast [run] [-config mantel-cast.json] [-mantel url] [-token t] [-device name] [-host ip] [-app id]
                                            keep the device on the dashboard (runs inside the LAN)
-  mantel-cast discover [-config f]         list Cast devices on the LAN (cast driver)
+  mantel-cast discover [-config f]         list devices (cast: on the LAN; ha: browser_mod browsers)
   mantel-cast status [-config f] [-device name] [-host ip]
                                            show what the device is running
   mantel-cast cast   [-config f] [-device name] [-host ip] [url]
                                            cast once (default: the configured dashboard)
   mantel-cast stop   [-config f] [-device name] [-host ip]
                                            stop whatever app the device is running
-                                           (fully: turn the screen off)
+                                           (fully: turn the screen off; ha: go home or turn it off)
 
 The config may be a mantel-cast.json ({"mantel", "token", "timezone", "cast"})
 or Mantel's own config.json (public_url, tokens, timezone and cast are read).
@@ -127,6 +128,9 @@ func loadConfig(path string) (*Config, error) {
 	c.emptyEnv = conf.EmptyEnv(c.Token)
 	c.Token = conf.ExpandEnv(c.Token)
 	c.Cast.Password = conf.ExpandEnv(c.Cast.Password)
+	if c.Cast.HA != nil {
+		c.Cast.HA.Token = conf.ExpandEnv(c.Cast.HA.Token)
+	}
 	c.loc = time.Local
 	if c.Timezone != "" {
 		if c.loc, err = time.LoadLocation(c.Timezone); err != nil {
@@ -291,8 +295,11 @@ func run(ctx context.Context, args []string) error {
 		}
 		u = keeper.WithToken(u, tok)
 		via := "DashCast"
-		if cfg.Cast.Driver == config.DriverFully {
+		switch cfg.Cast.Driver {
+		case config.DriverFully:
 			via = "Fully Kiosk"
+		case config.DriverHA:
+			via = "Home Assistant dashboard " + cfg.Cast.HA.Path + " framing"
 		}
 		log.Printf("mantel-cast: %s with %s", via, keeper.Redact(u))
 	} else {
@@ -356,9 +363,17 @@ func discover(ctx context.Context, args []string) error {
 		return err
 	}
 	if len(devs) == 0 {
-		fmt.Println("no Cast devices found (same LAN/VLAN? mDNS blocked?)")
+		hint := "same LAN/VLAN? mDNS blocked?"
+		if drv.Name() == config.DriverHA {
+			hint = "open Home Assistant on the device and register it in the Browser Mod panel"
+		}
+		fmt.Printf("no devices found (%s)\n", hint)
 	}
 	for _, d := range devs {
+		if d.Port == 0 {
+			fmt.Printf("%-28s %-22s %s\n", d.Name, d.Model, d.Host)
+			continue
+		}
 		fmt.Printf("%-28s %-22s %s:%d  %s\n", d.Name, d.Model, d.Host, d.Port, d.ID)
 	}
 	return nil

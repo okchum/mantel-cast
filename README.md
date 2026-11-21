@@ -1,6 +1,6 @@
 # Mantel Cast
 
-让 Google Nest Hub (Max) 一直亮着你的 [Mantel](https://github.com/okchum/mantel) 页面（其实任何网页都行）。也支持装了 Fully Kiosk Browser 的 Android 平板（见「其他设备」）。
+让 Google Nest Hub (Max) 一直亮着你的 [Mantel](https://github.com/okchum/mantel) 页面（其实任何网页都行）。也支持装了 Fully Kiosk Browser 的 Android 平板，以及 Home Assistant 通过 browser_mod 控制的浏览器（见「其他设备」）。
 
 Cast 协议只在局域网里工作，Google 也没有从云端启动设备上 App 的接口，所以 Mantel 放在外网时，家里得有个小程序盯着设备：这就是 Mantel Cast。它不提供页面、不采集数据，只做一件事：
 
@@ -60,13 +60,14 @@ export MANTEL_TOKEN=...                        # "$NAME" 读环境变量
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `driver` | `cast` | 屏幕类型：`cast`（Nest Hub、Chromecast、带 Cast 的电视）或 `fully`（Fully Kiosk Browser，见「其他设备」）。 |
+| `driver` | `cast` | 屏幕类型：`cast`（Nest Hub、Chromecast、带 Cast 的电视）、`fully`（Fully Kiosk Browser）或 `ha`（Home Assistant browser_mod），后两种见「其他设备」。 |
 | `enabled` | `true` | `false` 时 `mantel-cast run` 什么都不做，只等退出信号（不退出，免得 systemd/Docker 反复重启）；`status`/`cast`/`stop` 调试命令照常可用。不写等于 `true`。 |
-| `device` | 第一台 | 选设备：先找名字完全相同的（不分大小写），再按 UUID，最后按名字或型号的子串。匹配到多台时用第一台并在日志里警告。 |
-| `host` | — | 设备 IP，写了就跳过 mDNS 发现（跨 VLAN 时用）。写了就要在路由器里给设备设 DHCP 固定地址，否则路由器重启后地址一变就连不上；不写时设备地址变了，Mantel Cast 会重新发现。 |
+| `device` | 第一台 | 选设备：先找名字完全相同的（不分大小写），再按 UUID，最后按名字或型号的子串。匹配到多台时用第一台并在日志里警告。`ha`：浏览器的 Browser ID。 |
+| `host` | — | 设备 IP，写了就跳过 mDNS 发现（跨 VLAN 时用）。写了就要在路由器里给设备设 DHCP 固定地址，否则路由器重启后地址一变就连不上；不写时设备地址变了，Mantel Cast 会重新发现。`ha`：也可以直接写 Browser ID。 |
 | `port` | `8009` | 设备的 Cast 端口，一般不用改。 |
 | `app_id` | DashCast | 自己的 Custom Receiver 的 App ID（见下文）。只用于 `cast`。 |
 | `password` | — | `fully` 的 Remote Admin 密码，`"$NAME"` 读环境变量。只用于 `fully`。 |
+| `ha` | — | `ha` 驱动的 Home Assistant：`url`、`token`（长期访问令牌，`"$NAME"` 读环境变量）、`path`（套着 Mantel 的 Webpage 仪表盘路径）、`home`（可选，收起时回到的页面）。只用于 `ha`。 |
 | `check_interval` | `30s` | 多久看一次设备。 |
 | `take_over` | `false` | `true`：别的 App 在用也抢回来。 |
 | `quiet` | `auto` | 见「自动安静」：`auto`、`hours`、`off`。 |
@@ -118,7 +119,7 @@ export MANTEL_TOKEN=...                        # "$NAME" 读环境变量
 3. **设备的夜间模式时间表**：Google Home App → 这台设备 → 设置 → 夜间模式。Mantel Cast 从局域网直接读（不用登录），每 5 分钟读一次（`night_mode_refresh`），读不到时沿用 1 小时内最后一次读到的（`night_mode_stale_for`）。
 4. **`quiet_hours`**：配置里的固定时段，比如 `"23:30-07:00"`，兜底。
 
-`"quiet": "hours"` 只看 `quiet_hours`；`"off"` 从不安静。`fully` 没有设备自己的勿扰/夜间模式，只看手机和 `quiet_hours`。
+`"quiet": "hours"` 只看 `quiet_hours`；`"off"` 从不安静。`fully`、`ha` 没有设备自己的勿扰/夜间模式，只看手机和 `quiet_hours`。
 
 ## 触摸与 Custom Receiver（可选，最稳）
 
@@ -144,15 +145,33 @@ export MANTEL_TOKEN=...                        # "$NAME" 读环境变量
    Fully 不在局域网里广播自己，必须写 `host`（`discover` 不适用）。
 3. 行为：屏幕关着、或停在 Fully 的起始页 → 亮屏、切到前台、打开页面；前台是别的 App 或别的网页 → 不打扰；安静时段 → 关屏。`status` 显示屏幕开关、前台 App 和当前页面（不带令牌），`stop` 关屏。
 
+**Home Assistant browser_mod**（`"driver": "ha"`）：已经在用 Home Assistant 的话，墙上平板多半开着 HA 的仪表盘；装了 [browser_mod](https://github.com/thomasloven/hass-browser_mod) 后，HA 能控制这个浏览器（HA App、Fully、普通浏览器都行），Mantel Cast 通过 HA 的 REST API 让它在 Mantel 和 HA 页面之间切换。
+
+1. HA 里装 browser_mod，在平板上打开 HA → 侧边栏 Browser Mod → 打开 Register，记下 Browser ID（`mantel-cast discover` 也能列出来）。
+2. HA 设置 → 仪表盘 → 添加仪表盘 → **网页**（Webpage），网址填带令牌的 Mantel 地址 `http://mantel.lan:8080/?k=令牌`，路径比如 `mantel`。browser_mod 只能在 HA 自己的页面之间跳转，所以 Mantel 要套在这个仪表盘里显示。HA 走 HTTPS 时 Mantel 也得是 HTTPS，否则浏览器会拦下这个 http 页面。
+3. HA 个人资料页底部创建一个长期访问令牌。
+4. 配置：
+
+   ```json
+   "cast": {
+     "driver": "ha", "device": "kitchen-tab",
+     "ha": { "url": "http://homeassistant.local:8123", "token": "$HA_TOKEN", "path": "/mantel", "home": "/lovelace/0" },
+     "quiet_hours": "23:30-07:00"
+   }
+   ```
+
+5. 行为：屏幕关着，或停在别的 HA 页面且 browser_mod 的活动传感器显示没人在用 → 亮屏并跳到 `path`；有人正在点别的页面 → 不打扰；安静时段 → 跳回 `home`，没写 `home` 就关屏。浏览器断开 HA（实体变成 unavailable）时按断线处理，等它回来。投之前照样先带令牌访问 Mantel 页面确认能打开（用的是 `mantel`/`public_url` 的地址，和仪表盘里填的应当是同一个）。
+
 **还能接的同类技术**（实现 `display.Driver` 即可）：
 
 | 技术 | 设备 | 怎么控制 | 状态 |
 |---|---|---|---|
 | Google Cast（DashCast / Custom Receiver） | Nest Hub、Chromecast、Google TV、带 Cast 的电视 | Cast v2 协议 + mDNS | 已支持（`cast`） |
 | Fully Kiosk Browser | Android / Fire 平板 | Remote Admin REST | 已支持（`fully`） |
-| Chromium kiosk + DevTools | 树莓派、小主机接的显示器 | `--remote-debugging-port` 的 `/json/list`、`/json/new?url` | 可做 |
-| Android TV / Fire TV | 电视盒子 | ADB `am start -a android.intent.action.VIEW -d <url>` | 可做（要开 ADB 调试） |
-| Home Assistant browser_mod | 任何开着 HA 页面的浏览器 | HA 服务调用 `browser_mod.navigate` | 可做（依赖 HA） |
+| Home Assistant browser_mod | 任何开着 HA 的浏览器（墙上平板） | HA REST API + `browser_mod.navigate` | 已支持（`ha`） |
+| Android TV / Google TV | 电视、电视盒子 | 自带 Cast | 用 `cast` 驱动 |
+| Fire TV | 亚马逊电视棒 | 没有 Cast；装 Fully 走 `fully`，或 ADB `am start -d <url>` | `fully` 可用；ADB 未做 |
+| Chromium kiosk + DevTools | 树莓派、小主机接的显示器 | `--remote-debugging-port` 的 `/json/list`、`/json/new?url` | 未做（这种机器一般直接开机自启 Mantel 页面，用不着守护） |
 
 不适合的：AirPlay、DLNA/UPnP、Miracast 只能投视频/图片或镜像屏幕，不能让设备自己打开网页；Echo Show 没有开放的局域网接口。
 
@@ -163,6 +182,7 @@ main.go             CLI：run / discover / status / cast / stop；配置读取
 internal/display    屏幕驱动接口（Driver / Session / Screen）和设备夜间模式的时间窗
 internal/cast       Cast 驱动：Cast v2 协议（手写 protobuf）、mDNS 发现、设备 setup 接口（夜间模式、身份）
 internal/fully      Fully Kiosk Browser 驱动（Remote Admin REST）
+internal/ha         Home Assistant browser_mod 驱动（HA REST API）
 internal/keeper     守护循环、安静判断、页面地址和令牌（不依赖具体驱动）
 internal/config     cast 配置（时长、时间窗的格式来自 mantel-kit）
 ```

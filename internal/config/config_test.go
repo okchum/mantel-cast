@@ -52,6 +52,10 @@ func TestCastNormalizeDrivers(t *testing.T) {
 	if err := c.Normalize(); err != nil || c.Driver != DriverFully {
 		t.Fatalf("fully: %+v %v", c, err)
 	}
+	c = Cast{Driver: DriverHA, Device: "kitchen-tab", HA: &HA{URL: "http://ha.lan:8123", Token: "t", Path: "/mantel"}}
+	if err := c.Normalize(); err != nil || c.Driver != DriverHA {
+		t.Fatalf("ha: %+v %v", c, err)
+	}
 	// All day is 00:00-24:00, and the error for an empty window says so.
 	c = Cast{QuietHours: "00:00-24:00"}
 	if err := c.Normalize(); err != nil {
@@ -100,6 +104,15 @@ func TestCastNormalizeRejects(t *testing.T) {
 		"fully with app_id":   {Driver: DriverFully, Host: "h", AppID: "ABCD1234"},
 		"fully with reload":   {Driver: DriverFully, Host: "h", Reload: 60},
 		"password for cast":   {Password: "pw"},
+		"ha without ha":       {Driver: DriverHA},
+		"ha without path":     {Driver: DriverHA, HA: &HA{URL: "http://ha.lan:8123"}},
+		"ha relative path":    {Driver: DriverHA, HA: &HA{URL: "http://ha.lan:8123", Path: "mantel"}},
+		"ha relative home":    {Driver: DriverHA, HA: &HA{URL: "http://ha.lan:8123", Path: "/mantel", Home: "home"}},
+		"ha bad url":          {Driver: DriverHA, HA: &HA{URL: "ha.lan:8123", Path: "/mantel"}},
+		"ha with port":        {Driver: DriverHA, Port: 8123, HA: &HA{URL: "http://ha.lan", Path: "/mantel"}},
+		"ha with app_id":      {Driver: DriverHA, AppID: "ABCD1234", HA: &HA{URL: "http://ha.lan", Path: "/mantel"}},
+		"ha with password":    {Driver: DriverHA, Password: "pw", HA: &HA{URL: "http://ha.lan", Path: "/mantel"}},
+		"ha section for cast": {HA: &HA{URL: "http://ha.lan", Path: "/mantel"}},
 	} {
 		if err := bad.Normalize(); err == nil {
 			t.Errorf("%s: %+v should fail", name, bad)

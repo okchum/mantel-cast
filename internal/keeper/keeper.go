@@ -21,6 +21,7 @@ import (
 	"github.com/okchum/mantel-cast/internal/config"
 	"github.com/okchum/mantel-cast/internal/display"
 	"github.com/okchum/mantel-cast/internal/fully"
+	"github.com/okchum/mantel-cast/internal/ha"
 )
 
 type Keeper struct {
@@ -98,6 +99,11 @@ func NewDriver(cfg config.Cast) (display.Driver, error) {
 		return cast.Driver{Options: cast.Options{AppID: cfg.App(), Reload: cfg.Reload}}, nil
 	case config.DriverFully:
 		return fully.Driver{Password: cfg.Password}, nil
+	case config.DriverHA:
+		if cfg.HA == nil {
+			return nil, fmt.Errorf("the %q driver needs cast.ha", config.DriverHA)
+		}
+		return ha.Driver{URL: cfg.HA.URL, Token: cfg.HA.Token, Path: cfg.HA.Path, Home: cfg.HA.Home}, nil
 	}
 	return nil, fmt.Errorf("unknown cast.driver %q", cfg.Driver)
 }
@@ -551,6 +557,11 @@ func ResolveAuto(u, deviceHost string) (string, error) {
 		return u, nil
 	}
 	ip, err := LocalIP(deviceHost)
+	if err != nil && deviceHost != "" {
+		// A device known by a name that is not an address (a Home
+		// Assistant browser ID): any LAN route will do.
+		ip, err = LocalIP("")
+	}
 	if err != nil {
 		return "", err
 	}

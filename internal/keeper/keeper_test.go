@@ -512,6 +512,11 @@ func TestResolveAuto(t *testing.T) {
 	if got, err := ResolveAuto("http://auto/", "127.0.0.1"); err != nil || got != "http://127.0.0.1/" {
 		t.Errorf("auto without port: %q %v", got, err)
 	}
+	// A device known by an ID that is no address (a browser_mod browser):
+	// any LAN route.
+	if got, err := ResolveAuto("http://auto:8080/", "kitchen tab"); err != nil || strings.Contains(got, "auto") {
+		t.Errorf("auto for a non-address device: %q %v", got, err)
+	}
 	_, err := ResolveAuto("http://auto:bad/?k=secret", "127.0.0.1")
 	if err == nil || strings.Contains(err.Error(), "secret") {
 		t.Errorf("bad URL error leaks the token: %v", err)
@@ -746,5 +751,24 @@ func TestOtherDriver(t *testing.T) {
 	}
 	if k.hub != nil || k.hubErr != "" {
 		t.Fatalf("night mode read from a driver without one: %+v %q", k.hub, k.hubErr)
+	}
+}
+
+func TestNewDriver(t *testing.T) {
+	for _, c := range []struct {
+		cfg  config.Cast
+		name string
+	}{
+		{config.Cast{}, "cast"},
+		{config.Cast{Driver: config.DriverFully}, "fully"},
+		{config.Cast{Driver: config.DriverHA, HA: &config.HA{URL: "http://ha.lan:8123", Path: "/mantel"}}, "ha"},
+	} {
+		d, err := NewDriver(c.cfg)
+		if err != nil || d.Name() != c.name {
+			t.Errorf("%+v: %v %v", c.cfg, d, err)
+		}
+	}
+	if _, err := NewDriver(config.Cast{Driver: config.DriverHA}); err == nil {
+		t.Error("ha without cast.ha")
 	}
 }

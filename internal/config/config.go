@@ -4,6 +4,8 @@ package config
 
 import (
 	"fmt"
+	"net/url"
+	"strings"
 	"time"
 
 	"github.com/okchum/mantel-kit/conf"
@@ -17,7 +19,22 @@ const AppDashCast = "84912283"
 const (
 	DriverCast  = "cast"  // Google Cast: Nest Hub, Chromecast, Cast TVs (default)
 	DriverFully = "fully" // Fully Kiosk Browser's Remote Admin (Android tablets)
+	DriverHA    = "ha"    // Home Assistant's browser_mod (any browser HA controls)
 )
+
+// HA is how the "ha" driver reaches Home Assistant.
+type HA struct {
+	URL string `json:"url"` // Home Assistant, e.g. http://homeassistant.local:8123
+	// Token is a long-lived access token ("$ENV_NAME" reads the
+	// environment, expanded by whoever loads the config).
+	Token string `json:"token"`
+	// Path is the Home Assistant path of the Webpage dashboard that frames
+	// the Mantel page ("/mantel"): showing the dashboard navigates there.
+	Path string `json:"path"`
+	// Home is where the browser goes when the dashboard is closed (quiet
+	// hours); empty = turn the screen off instead.
+	Home string `json:"home"`
+}
 
 // Duration is a time.Duration that unmarshals from strings like "30s" or "5m".
 type Duration = conf.Duration
@@ -26,15 +43,16 @@ type Cast struct {
 	// Enabled = false keeps "mantel-cast run" idle (Mantel's config.json may carry
 	// this section for a box that does not run Mantel Cast). Absent = enabled.
 	Enabled *bool `json:"enabled"`
-	// Driver is the screen technology: "cast" (default) or "fully".
+	// Driver is the screen technology: "cast" (default), "fully" or "ha".
 	Driver string `json:"driver"`
-	Device string `json:"device"` // name, UUID or name/model substring, matched case-insensitively
-	Host   string `json:"host"`   // skip discovery when set (fully: required, it cannot be discovered)
+	Device string `json:"device"` // name, UUID or name/model substring, matched case-insensitively (ha: the browser ID)
+	Host   string `json:"host"`   // skip discovery when set (fully: required, it cannot be discovered; ha: the browser ID)
 	Port   int    `json:"port"`
 	AppID  string `json:"app_id"` // cast: default DashCast; set to your Custom Receiver id to use one
 	// Password is Fully's Remote Admin password ("$ENV_NAME" reads the
 	// environment, expanded by whoever loads the config).
 	Password      string   `json:"password"`
+	HA            *HA      `json:"ha"` // the "ha" driver's Home Assistant
 	CheckInterval Duration `json:"check_interval"`
 	// TakeOver re-casts even when another app (YouTube, Spotify, ...) is playing.
 	// Default false: only re-cast when the device sits on its idle/ambient screen.
@@ -143,19 +161,23 @@ func (c *Cast) Normalize() error {
 	switch c.Driver {
 	case "":
 		c.Driver = DriverCast
-	case DriverCast, DriverFully:
+	case DriverCast, DriverFully, DriverHA:
 	default:
-		return fmt.Errorf("cast.driver must be %q or %q, not %q", DriverCast, DriverFully, c.Driver)
+		return fmt.Errorf("cast.driver must be %q, %q or %q, not %q", DriverCast, DriverFully, DriverHA, c.Driver)
 	}
-	if c.Driver == DriverFully {
+	if c.Driver != DriverCast {
 		if c.AppID != "" && c.AppID != AppDashCast {
-			return fmt.Errorf("cast.app_id is for the cast driver, not %q", DriverFully)
+			return fmt.Errorf("cast.app_id is for the cast driver, not %q", c.Driver)
 		}
 		if c.Reload != 0 {
-			return fmt.Errorf("cast.reload_seconds is for the cast driver (DashCast); set Fully's own auto reload instead")
+			return fmt.Errorf("cast.reload_seconds is for the cast driver (DashCast), not %q", c.Driver)
 		}
-	} else if c.Password != "" {
+	}
+	if c.Password != "" && c.Driver != DriverFully {
 		return fmt.Errorf("cast.password is for the %q driver", DriverFully)
+	}
+	if err := c.normalizeHA(); err != nil {
+		return err
 	}
 	c.AppID = c.App()
 	switch c.Quiet {
@@ -201,6 +223,32 @@ func (c *Cast) Normalize() error {
 	}
 	if t := c.Timings(); t.PauseMin > t.PauseMax {
 		return fmt.Errorf("cast.pause_min (%s) is longer than cast.pause_max (%s)", t.PauseMin, t.PauseMax)
+	}
+	return nil
+}
+
+func (c *Cast) normalizeHA() error {
+	if c.Driver != DriverHA {
+		if c.HA != nil {
+			return fmt.Errorf("cast.ha is for the %q driver", DriverHA)
+		}
+		return nil
+	}
+	h := c.HA
+	switch {
+	case h == nil || h.URL == "":
+		return fmt.Errorf("the %q driver needs cast.ha.url (Home Assistant's address)", DriverHA)
+	case h.Path == "":
+		return fmt.Errorf("the %q driver needs cast.ha.path (the dashboard that frames Mantel, e.g. \"/mantel\")", DriverHA)
+	case !strings.HasPrefix(h.Path, "/"):
+		return fmt.Errorf("cast.ha.path %q must start with /", h.Path)
+	case h.Home != "" && !strings.HasPrefix(h.Home, "/"):
+		return fmt.Errorf("cast.ha.home %q must start with /", h.Home)
+	case c.Port != 0:
+		return fmt.Errorf("cast.port is not used by the %q driver (the port goes in cast.ha.url)", DriverHA)
+	}
+	if u, err := url.Parse(h.URL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return fmt.Errorf("cast.ha.url %q: want http(s)://host:port", h.URL)
 	}
 	return nil
 }
