@@ -15,12 +15,6 @@ jobs:
     defaults:
       run:
         working-directory: mantel-cast
-    env:
-      # mantel-kit (and okchum/mantel below) are fetched from GitHub. While
-      # they are private, set the OKCHUM_READ_TOKEN secret to a fine-grained
-      # token with read access to them; public repos need nothing.
-      GOPRIVATE: github.com/okchum
-      READ_TOKEN: ${{ secrets.OKCHUM_READ_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,10 +25,6 @@ jobs:
         with:
           repository: okchum/mantel
           path: mantel
-          token: ${{ secrets.OKCHUM_READ_TOKEN || github.token }}
-      - name: private module access
-        if: env.READ_TOKEN != ''
-        run: git config --global url."https://x-access-token:${READ_TOKEN}@github.com/okchum/".insteadOf "https://github.com/okchum/"
       # go.mod's "go" line is the oldest Go the module builds with, not the
       # one to test, scan and release with: use the current supported release.
       - uses: actions/setup-go@v5

@@ -8,7 +8,7 @@ Cast 协议只在局域网里工作，Google 也没有从云端启动设备上 A
 - 正在播 YouTube/Spotify → 不打扰；
 - 夜里 → 主动关掉页面，让设备回到自己的暗色时钟，早上再投回来。
 
-单个二进制，只用 Go 标准库和同作者的 [mantel-kit](https://github.com/okchum/mantel-kit)（和服务端共用的配置格式），没有别的依赖；Cast v2 协议和 mDNS 发现都是自己实现的，不需要 Python、catt、Home Assistant。
+单个二进制，只用 Go 标准库和同作者的 [mantel-kit](https://github.com/okchum/mantel-kit)（和服务端共用的配置格式），没有别的依赖；Cast v2 协议和 mDNS 发现都是自己实现的，不需要 Python、catt、Home Assistant（`ha` 驱动本来就是通过 HA 控制，除外）。
 
 ## 快速开始
 
