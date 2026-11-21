@@ -4,3 +4,8 @@ updates:
     directory: /
     schedule:
       interval: monthly
+  # mantel-kit releases (the only Go dependency).
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: monthly
