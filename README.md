@@ -186,3 +186,7 @@ internal/ha         Home Assistant browser_mod 驱动（HA REST API）
 internal/keeper     守护循环、安静判断、页面地址和令牌（不依赖具体驱动）
 internal/config     cast 配置（时长、时间窗的格式来自 mantel-kit）
 ```
+
+## 许可证
+
+[MIT](LICENSE)
