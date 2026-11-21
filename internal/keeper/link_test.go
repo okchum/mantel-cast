@@ -89,3 +89,10 @@ func TestMantelQuietContract(t *testing.T) {
 		t.Fatalf("awake without by: %+v %v", a, err)
 	}
 }
+
+func TestFetchAsleepBadURLHidesToken(t *testing.T) {
+	_, err := FetchAsleep(context.Background(), "http://h:bad/?k=secret")
+	if err == nil || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error leaks the token: %v", err)
+	}
+}

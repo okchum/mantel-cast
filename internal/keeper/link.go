@@ -3,6 +3,7 @@ package keeper
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -80,7 +81,12 @@ func Redact(u string) string {
 func FetchAsleep(ctx context.Context, page string) (*Asleep, error) {
 	u, err := neturl.Parse(page)
 	if err != nil {
-		return nil, err
+		// url.Error quotes the whole URL, token included.
+		var ue *neturl.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return nil, fmt.Errorf("sleep reports: page %s: %w", Redact(page), err)
 	}
 	tok := u.Query().Get("k")
 	u = u.ResolveReference(&neturl.URL{Path: "api/v1/quiet"})
