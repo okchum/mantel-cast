@@ -612,14 +612,18 @@ func (c *Client) LoadURL(ctx context.Context, url string, force bool, reloadSeco
 			return nil, err
 		}
 	}
-	err = c.Send(ctx, app.TransportID, NamespaceDashCast, map[string]any{
+	if err := c.Send(ctx, app.TransportID, NamespaceDashCast, loadPayload(url, force, reloadSeconds)); err != nil {
+		return nil, err
+	}
+	return app, nil
+}
+
+// loadPayload is DashCast's load message.
+func loadPayload(url string, force bool, reloadSeconds int) map[string]any {
+	return map[string]any{
 		"url":         url,
 		"force":       force,
 		"reload":      reloadSeconds != 0,
 		"reload_time": reloadSeconds,
-	})
-	if err != nil {
-		return nil, err
 	}
-	return app, nil
 }

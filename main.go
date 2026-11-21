@@ -1,4 +1,5 @@
-// Mantel Cast keeps a Google Nest Hub showing a Mantel dashboard. Cast only works
+// Mantel Cast keeps a Google Nest Hub (or another Cast device, or a tablet
+// running Fully Kiosk Browser) showing a Mantel dashboard. Cast only works
 // inside the LAN, so Mantel Cast runs at home even when Mantel lives on a public
 // server: it re-casts when the device drops back to its idle screen, stays
 // out of the way while something else plays, and goes quiet at night.
@@ -21,26 +22,27 @@ import (
 	"time"
 	_ "time/tzdata"
 
-	"github.com/okchum/mantel-cast/internal/cast"
 	"github.com/okchum/mantel-cast/internal/config"
+	"github.com/okchum/mantel-cast/internal/display"
 	"github.com/okchum/mantel-cast/internal/keeper"
 	"github.com/okchum/mantel-kit/conf"
 )
 
 var version = "dev"
 
-const usage = `mantel-cast %s — keeps a Google Nest Hub on your Mantel dashboard
+const usage = `mantel-cast %s — keeps a Google Nest Hub (or a Fully Kiosk tablet) on your Mantel dashboard
 
 Usage:
   mantel-cast [run] [-config mantel-cast.json] [-mantel url] [-token t] [-device name] [-host ip] [-app id]
                                            keep the device on the dashboard (runs inside the LAN)
-  mantel-cast discover [-config f]         list Cast devices on the LAN
+  mantel-cast discover [-config f]         list Cast devices on the LAN (cast driver)
   mantel-cast status [-config f] [-device name] [-host ip]
                                            show what the device is running
   mantel-cast cast   [-config f] [-device name] [-host ip] [url]
                                            cast once (default: the configured dashboard)
   mantel-cast stop   [-config f] [-device name] [-host ip]
                                            stop whatever app the device is running
+                                           (fully: turn the screen off)
 
 The config may be a mantel-cast.json ({"mantel", "token", "timezone", "cast"})
 or Mantel's own config.json (public_url, tokens, timezone and cast are read).
@@ -124,6 +126,7 @@ func loadConfig(path string) (*Config, error) {
 	// The token is expanded here, once, for both config kinds.
 	c.emptyEnv = conf.EmptyEnv(c.Token)
 	c.Token = conf.ExpandEnv(c.Token)
+	c.Cast.Password = conf.ExpandEnv(c.Cast.Password)
 	c.loc = time.Local
 	if c.Timezone != "" {
 		if c.loc, err = time.LoadLocation(c.Timezone); err != nil {
@@ -269,25 +272,33 @@ func run(ctx context.Context, args []string) error {
 	if *f.appID != "" {
 		cfg.Cast.AppID = *f.appID
 	}
+	drv, err := keeper.NewDriver(cfg.Cast)
+	if err != nil {
+		return err
+	}
 	u := cmp.Or(*f.mantel, cfg.Mantel)
 	tok := cmp.Or(*f.token, cfg.Token)
 	// Only here: discover/status/stop do not use the token, and -token
 	// replaces the configured one.
 	if *f.token == "" {
-		if w := tokenWarning(cfg.emptyEnv, tok, u, cfg.Cast.DashCast()); w != "" {
+		if w := tokenWarning(cfg.emptyEnv, tok, u, drv.LoadsPage()); w != "" {
 			log.Printf("mantel-cast: warning: %s", w)
 		}
 	}
-	if cfg.Cast.DashCast() {
+	if drv.LoadsPage() {
 		if u == "" {
 			return errors.New(`mantel-cast needs the dashboard URL: "mantel" in mantel-cast.json or -mantel https://… (or set cast.app_id to a Custom Receiver)`)
 		}
 		u = keeper.WithToken(u, tok)
-		log.Printf("mantel-cast: DashCast with %s", keeper.Redact(u))
+		via := "DashCast"
+		if cfg.Cast.Driver == config.DriverFully {
+			via = "Fully Kiosk"
+		}
+		log.Printf("mantel-cast: %s with %s", via, keeper.Redact(u))
 	} else {
 		log.Printf("mantel-cast: Custom Receiver %s (its URL is set in the Cast console)", cfg.Cast.App())
 	}
-	k := &keeper.Keeper{Cfg: cfg.Cast, URL: u, Loc: cfg.loc}
+	k := &keeper.Keeper{Cfg: cfg.Cast, Driver: drv, URL: u, Loc: cfg.loc}
 	if u != "" {
 		// Phone sleep reports land on Mantel; ask it.
 		k.Phone = func(ctx context.Context) (*keeper.Asleep, error) {
@@ -336,7 +347,11 @@ func discover(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	devs, err := cast.Discover(ctx, cfg.Cast.Timings().DiscoverTimeout)
+	drv, err := keeper.NewDriver(cfg.Cast)
+	if err != nil {
+		return err
+	}
+	devs, err := drv.Discover(ctx, cfg.Cast.Timings().DiscoverTimeout)
 	if err != nil {
 		return err
 	}
@@ -344,7 +359,7 @@ func discover(ctx context.Context, args []string) error {
 		fmt.Println("no Cast devices found (same LAN/VLAN? mDNS blocked?)")
 	}
 	for _, d := range devs {
-		fmt.Printf("%-28s %-22s %s:%d  %s\n", d.Name, d.Model, d.Host, d.Port, d.UUID)
+		fmt.Printf("%-28s %-22s %s:%d  %s\n", d.Name, d.Model, d.Host, d.Port, d.ID)
 	}
 	return nil
 }
@@ -357,11 +372,16 @@ func deviceCmd(ctx context.Context, cmd string, args []string) error {
 	if err != nil {
 		return err
 	}
-	h, port, name, err := keeper.Resolve(ctx, cfg.Cast)
+	drv, err := keeper.NewDriver(cfg.Cast)
 	if err != nil {
 		return err
 	}
-	c, err := cast.Dial(ctx, h, port)
+	d, err := keeper.Resolve(ctx, cfg.Cast, drv)
+	if err != nil {
+		return err
+	}
+	h, name := d.Host, d.Name
+	c, err := drv.Dial(ctx, h, d.Port)
 	if err != nil {
 		return err
 	}
@@ -376,31 +396,20 @@ func deviceCmd(ctx context.Context, cmd string, args []string) error {
 
 	switch cmd {
 	case "status":
-		st, err := c.Status(tctx)
+		sc, err := c.Observe(tctx)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("%s (%s)\n", name, h)
-		if len(st.Apps) == 0 {
+		if len(sc.Detail) == 0 {
 			fmt.Println("  no app running")
 		}
-		for _, a := range st.Apps {
-			fmt.Printf("  %s  %q  idle=%v  %s\n", a.AppID, a.DisplayName, a.IsIdleScreen, a.StatusText)
+		for _, l := range sc.Detail {
+			fmt.Println("  " + l)
 		}
 		return nil
 	case "stop":
-		st, err := c.Status(tctx)
-		if err != nil {
-			return err
-		}
-		for _, a := range st.Apps {
-			if a.AppID != cast.AppBackdrop {
-				fmt.Printf("stopping %s on %s\n", a.DisplayName, name)
-				return c.Stop(tctx, a.SessionID)
-			}
-		}
-		fmt.Println("nothing to stop")
-		return nil
+		return stopScreen(tctx, c, name)
 	default: // cast
 		u := cmp.Or(fs.Arg(0), cfg.Mantel)
 		if u == "" {
@@ -411,7 +420,21 @@ func deviceCmd(ctx context.Context, cmd string, args []string) error {
 		}
 		u = keeper.WithToken(u, cfg.Token)
 		fmt.Printf("casting %s to %s\n", keeper.Redact(u), name)
-		_, err = keeper.Show(tctx, c, cfg.Cast, u)
+		_, err = c.Show(tctx, u)
 		return err
 	}
+}
+
+// stopScreen takes whatever shows off the device (unless it is already idle).
+func stopScreen(ctx context.Context, c display.Session, name string) error {
+	sc, err := c.Observe(ctx)
+	if err != nil {
+		return err
+	}
+	if sc.Idle {
+		fmt.Println("nothing to stop")
+		return nil
+	}
+	fmt.Printf("stopping %s on %s\n", sc.Showing, name)
+	return c.Hide(ctx, sc.Handle)
 }

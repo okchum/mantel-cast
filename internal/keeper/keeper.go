@@ -1,6 +1,8 @@
-// Package keeper keeps the dashboard on the Nest Hub screen: it watches the
-// receiver status and re-casts whenever the device falls back to its idle
-// (ambient/photo frame) screen, without stealing the screen from other apps.
+// Package keeper keeps the dashboard on a screen (a Nest Hub, a kiosk
+// tablet): it watches what the device shows and puts the dashboard back
+// whenever the device falls back to its idle (ambient, photo frame, screen
+// off) state, without stealing the screen from other apps. The screen
+// technology is a display.Driver; the keeper only decides when.
 package keeper
 
 import (
@@ -17,33 +19,40 @@ import (
 
 	"github.com/okchum/mantel-cast/internal/cast"
 	"github.com/okchum/mantel-cast/internal/config"
+	"github.com/okchum/mantel-cast/internal/display"
+	"github.com/okchum/mantel-cast/internal/fully"
 )
 
 type Keeper struct {
 	Cfg config.Cast
-	// URL is the page DashCast opens. A host of "auto" (http://auto:8080/)
+	// Driver is the screen technology; nil = NewDriver(Cfg).
+	Driver display.Driver
+	// URL is the page the device opens. A host of "auto" (http://auto:8080/)
 	// stands for this machine's LAN address as seen from the device, worked
 	// out again before every launch so a DHCP change heals by itself.
 	URL string
 	Loc *time.Location // nil = time.Local
-	// Reachable checks the page answers before casting it; nil means an HTTP
-	// GET from this machine (tests replace it).
+	// Reachable checks the page (with its token) answers before casting it;
+	// nil means an HTTP GET from this machine (tests replace it).
 	Reachable func(ctx context.Context, url string) error
 	Now       func() time.Time // nil = time.Now
 	// Phone returns the latest phone sleep report (nil, nil = none yet).
 	// Nil func: no phone signal.
 	Phone func(ctx context.Context) (*Asleep, error)
-	// NightMode reads the device's night mode; nil = cast.FetchNightMode.
-	NightMode func(ctx context.Context, host string) (*cast.NightMode, error)
+	// NightMode reads the device's night mode; nil = the session's own
+	// (display.NightModer), none if the driver has no night mode.
+	NightMode func(ctx context.Context, host string) (*display.NightMode, error)
 
-	// Seams for tests: nil = cast.Dial, cast.Discover, a real sleep.
-	dial     func(ctx context.Context, host string, port int) (Conn, error)
-	discover func(ctx context.Context, timeout time.Duration) ([]cast.Device, error)
+	// Seams for tests: nil = the driver's Dial and Discover, a real sleep.
+	dial     func(ctx context.Context, host string, port int) (display.Session, error)
+	discover func(ctx context.Context, timeout time.Duration) ([]display.Device, error)
 	sleep    func(ctx context.Context, d time.Duration) bool
 
-	host       string // last device address that answered
+	sess       display.Session // the live session, while runSession runs
+	host       string          // last device address that answered
 	port       int
 	deviceName string
+	deviceID   string // its identity, when discovery or the device told it
 	checked    bool   // a status has been seen since this process started
 	session    string // session id of the app this process launched (or adopted)
 	loadedOnce bool
@@ -58,7 +67,7 @@ type Keeper struct {
 	pauseUntil time.Time
 	pauseStep  time.Duration
 
-	hub              *cast.NightMode // last good night mode reading
+	hub              *display.NightMode // last good night mode reading
 	hubAt            time.Time
 	hubErr, phoneErr string // last logged errors (log on change only)
 }
@@ -73,6 +82,36 @@ var httpClient = func() *http.Client {
 	t.Proxy = nil
 	return &http.Client{Transport: t}
 }()
+
+// probeClient is httpClient without following redirects: the probe's
+// answer is the page's first status (Mantel sets its cookie on the ?k=
+// request; following a redirect without a cookie jar would 401).
+var probeClient = &http.Client{
+	Transport:     httpClient.Transport,
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+}
+
+// NewDriver is the screen technology cfg.Driver names.
+func NewDriver(cfg config.Cast) (display.Driver, error) {
+	switch cfg.Driver {
+	case "", config.DriverCast:
+		return cast.Driver{Options: cast.Options{AppID: cfg.App(), Reload: cfg.Reload}}, nil
+	case config.DriverFully:
+		return fully.Driver{Password: cfg.Password}, nil
+	}
+	return nil, fmt.Errorf("unknown cast.driver %q", cfg.Driver)
+}
+
+func (k *Keeper) driver() display.Driver {
+	if k.Driver != nil {
+		return k.Driver
+	}
+	if d, err := NewDriver(k.Cfg); err == nil {
+		return d
+	}
+	// Normalize rejects unknown drivers; Cast is the fallback.
+	return cast.Driver{Options: cast.Options{AppID: k.Cfg.App(), Reload: k.Cfg.Reload}}
+}
 
 // Reconnect backoff: doubles from backoffMin to backoffMax, back to
 // backoffMin after a session that stayed up for healthyAfter. The cap is
@@ -154,78 +193,95 @@ func (b *backoff) next(lasted time.Duration) time.Duration {
 	return b.cur
 }
 
-// Conn is a live connection to the device.
-type Conn interface {
-	Device
-	Done() <-chan struct{}
-	Close() error
-}
-
-func dialCast(ctx context.Context, host string, port int) (Conn, error) {
-	return cast.Dial(ctx, host, port)
-}
-
-// connect dials the device: the last address that answered first, then
-// the configured host or mDNS discovery.
-func (k *Keeper) connect(ctx context.Context) (Conn, error) {
+// connect dials the device: the last address that answered first (if the
+// same device still answers there), then the configured host or discovery.
+func (k *Keeper) connect(ctx context.Context) (display.Session, error) {
 	dial := k.dial
 	if dial == nil {
-		dial = dialCast
+		dial = k.driver().Dial
 	}
 	if k.Cfg.Host == "" && k.host != "" {
-		c, err := dial(ctx, k.host, k.port)
-		if err == nil {
-			return c, nil
+		s, err := dial(ctx, k.host, k.port)
+		switch {
+		case err != nil:
+			logf("cast: %s at %s does not answer (%v), looking for it again", k.deviceName, k.host, err)
+		case k.sameDevice(ctx, s):
+			return s, nil
+		default:
+			_ = s.Close()
 		}
-		logf("cast: %s at %s does not answer (%v), looking for it again", k.deviceName, k.host, err)
 	}
-	host, port, name, err := resolve(ctx, k.Cfg, k.discover)
+	d, err := resolve(ctx, k.Cfg, k.discover, k.driver())
 	if err != nil {
 		return nil, err
 	}
-	c, err := dial(ctx, host, port)
+	s, err := dial(ctx, d.Host, d.Port)
 	if err != nil {
-		return nil, fmt.Errorf("connect %s: %w", host, err)
+		return nil, fmt.Errorf("connect %s: %w", d.Host, err)
 	}
-	k.host, k.port, k.deviceName = host, port, name
-	return c, nil
+	k.host, k.port, k.deviceName, k.deviceID = d.Host, d.Port, d.Name, d.ID
+	return s, nil
 }
 
-// Resolve finds the target device: the configured host, or mDNS discovery
-// matched by name.
-func Resolve(ctx context.Context, cfg config.Cast) (host string, port int, name string, err error) {
-	return resolve(ctx, cfg, nil)
+// sameDevice reports whether the device answering at the remembered
+// address is still the one found before: DHCP may have given the address to
+// another device of the same kind. Sessions that cannot tell, or a failed
+// read, count as the same.
+func (k *Keeper) sameDevice(ctx context.Context, s display.Session) bool {
+	id, ok := s.(display.Identifier)
+	if !ok {
+		return true
+	}
+	ictx, cancel := context.WithTimeout(ctx, k.Cfg.Timings().CommandTimeout)
+	d, err := id.Identify(ictx)
+	cancel()
+	if err != nil {
+		return true
+	}
+	differs := false
+	if k.deviceID != "" && d.ID != "" {
+		differs = normID(d.ID) != normID(k.deviceID)
+	} else if k.deviceName != "" && d.Name != "" {
+		differs = !strings.EqualFold(d.Name, k.deviceName)
+	}
+	if differs {
+		logf("cast: %s now answers as %q, not %s; looking for %s again", k.host, d.Name, k.deviceName, k.deviceName)
+	}
+	return !differs
 }
 
-func resolve(ctx context.Context, cfg config.Cast, discover func(context.Context, time.Duration) ([]cast.Device, error)) (string, int, string, error) {
+func normID(s string) string { return strings.ReplaceAll(strings.ToLower(s), "-", "") }
+
+// Resolve finds the target device: the configured host, or the driver's
+// discovery matched by name.
+func Resolve(ctx context.Context, cfg config.Cast, drv display.Driver) (display.Device, error) {
+	return resolve(ctx, cfg, nil, drv)
+}
+
+func resolve(ctx context.Context, cfg config.Cast, discover func(context.Context, time.Duration) ([]display.Device, error), drv display.Driver) (display.Device, error) {
 	if cfg.Host != "" {
-		return cfg.Host, cfg.Port, cfg.Host, nil
+		return display.Device{Name: cfg.Host, Host: cfg.Host, Port: cfg.Port}, nil
 	}
 	if discover == nil {
-		discover = cast.Discover
+		discover = drv.Discover
 	}
 	devs, err := discover(ctx, cfg.Timings().DiscoverTimeout)
 	if err != nil {
-		return "", 0, "", fmt.Errorf("discover: %w", err)
+		return display.Device{}, fmt.Errorf("discover: %w", err)
 	}
-	d, err := pickDevice(devs, cfg.Device)
-	if err != nil {
-		return "", 0, "", err
-	}
-	return d.Host, d.Port, d.Name, nil
+	return pickDevice(devs, cfg.Device)
 }
 
 // pickDevice matches want (case-insensitively) against the devices: an exact
 // name first, then the UUID, then a name or model substring. Several
 // matches at the same level take the first and log a warning.
-func pickDevice(devs []cast.Device, want string) (cast.Device, error) {
+func pickDevice(devs []display.Device, want string) (display.Device, error) {
 	want = strings.ToLower(strings.TrimSpace(want))
-	uuid := func(s string) string { return strings.ReplaceAll(strings.ToLower(s), "-", "") }
-	tiers := []func(d cast.Device) bool{
-		func(d cast.Device) bool { return want == "" },
-		func(d cast.Device) bool { return strings.ToLower(d.Name) == want },
-		func(d cast.Device) bool { return d.UUID != "" && uuid(d.UUID) == uuid(want) },
-		func(d cast.Device) bool {
+	tiers := []func(d display.Device) bool{
+		func(d display.Device) bool { return want == "" },
+		func(d display.Device) bool { return strings.ToLower(d.Name) == want },
+		func(d display.Device) bool { return d.ID != "" && normID(d.ID) == normID(want) },
+		func(d display.Device) bool {
 			return strings.Contains(strings.ToLower(d.Name), want) || strings.Contains(strings.ToLower(d.Model), want)
 		},
 	}
@@ -233,7 +289,7 @@ func pickDevice(devs []cast.Device, want string) (cast.Device, error) {
 		tiers = tiers[1:]
 	}
 	for _, match := range tiers {
-		var found []cast.Device
+		var found []display.Device
 		for _, d := range devs {
 			if match(d) {
 				found = append(found, d)
@@ -248,10 +304,10 @@ func pickDevice(devs []cast.Device, want string) (cast.Device, error) {
 		}
 		return found[0], nil
 	}
-	return cast.Device{}, fmt.Errorf("no cast device matching %q (found: %s)", want, deviceNames(devs))
+	return display.Device{}, fmt.Errorf("no device matching %q (found: %s)", want, deviceNames(devs))
 }
 
-func deviceNames(devs []cast.Device) string {
+func deviceNames(devs []display.Device) string {
 	names := make([]string, 0, len(devs))
 	for _, d := range devs {
 		names = append(names, fmt.Sprintf("%q", d.Name))
@@ -264,7 +320,8 @@ func (k *Keeper) runSession(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	defer func() { _ = c.Close() }()
+	k.sess = c
+	defer func() { k.sess = nil; _ = c.Close() }()
 
 	tick := time.NewTicker(k.Cfg.Timings().CheckInterval)
 	defer tick.Stop()
@@ -284,20 +341,11 @@ func (k *Keeper) runSession(ctx context.Context) error {
 	}
 }
 
-// Device is the part of *cast.Client the keeper uses.
-type Device interface {
-	Status(ctx context.Context) (*cast.ReceiverStatus, error)
-	Stop(ctx context.Context, sessionID string) error
-	Launch(ctx context.Context, appID string) (*cast.App, error)
-	LoadURL(ctx context.Context, url string, force bool, reloadSeconds int) (*cast.App, error)
-}
-
 // appLevel reports a device refusing a command (it answered, the
 // connection is fine) and swallows it; anything else is returned so the
 // connection is rebuilt.
 func (k *Keeper) appLevel(what string, err error) error {
-	var re *cast.ResponseError
-	if errors.As(err, &re) {
+	if errors.Is(err, display.ErrRefused) {
 		k.report("%s: %v", what, err)
 		return nil
 	}
@@ -306,7 +354,7 @@ func (k *Keeper) appLevel(what string, err error) error {
 
 // check runs one round: see what the device shows, then close the dashboard
 // for the quiet hours, leave it, or (re)cast it.
-func (k *Keeper) check(ctx context.Context, c Device) error {
+func (k *Keeper) check(ctx context.Context, c display.Session) error {
 	t := k.Cfg.Timings()
 	now := k.now()
 	// The quiet signals come over the network (Mantel, the device's setup
@@ -318,20 +366,21 @@ func (k *Keeper) check(ctx context.Context, c Device) error {
 	if err != nil {
 		return err
 	}
-	running, ourApp, ours, idle := scr.running, scr.ourApp, scr.ours, scr.idle
+	ourApp, ours, idle := scr.Ours, scr.ours, scr.Idle
 	if quiet {
 		return k.closeForQuiet(ctx, c, t, scr, why)
 	}
 
+	loadsPage := k.driver().LoadsPage()
 	want := k.URL
-	if k.Cfg.DashCast() {
+	if loadsPage {
 		if want, err = k.target(); err != nil {
 			k.report("not casting: %v", err)
 			return nil
 		}
 	}
 	switch {
-	case ours && k.loadedOnce && (!k.Cfg.DashCast() || want == k.shown):
+	case ours && k.loadedOnce && (!loadsPage || want == k.shown):
 		k.seenUp = now
 		if !k.upSince.IsZero() && now.Sub(k.upSince) >= t.StableAfter {
 			k.pauseStep = 0
@@ -347,7 +396,7 @@ func (k *Keeper) check(ctx context.Context, c Device) error {
 		// Someone chose to watch something else (or cast DashCast themselves):
 		// the dashboard leaving for that is not a crash.
 		k.loadedOnce, k.relaunches = false, nil
-		name := running.DisplayName
+		name := scr.Showing
 		if ourApp {
 			name += " (cast by someone else)"
 		}
@@ -366,12 +415,12 @@ func (k *Keeper) check(ctx context.Context, c Device) error {
 		k.report("paused until %s: the dashboard kept closing on the device", k.pauseUntil.In(k.loc()).Format("15:04"))
 		return nil
 	}
-	if k.Cfg.DashCast() && !k.pageAnswers(ctx, want, t.ProbeTimeout) {
+	if loadsPage && !k.pageAnswers(ctx, want, t.ProbeTimeout) {
 		return nil
 	}
 	lctx, cancel := context.WithTimeout(ctx, t.LaunchTimeout)
 	defer cancel()
-	sess, err := Show(lctx, c, k.Cfg, want)
+	sess, err := c.Show(lctx, want)
 	if err != nil {
 		return k.appLevel("cast", err)
 	}
@@ -387,48 +436,36 @@ func (k *Keeper) check(ctx context.Context, c Device) error {
 
 // screen is what the device shows, as check sees it.
 type screen struct {
-	running *cast.App // nil when nothing runs
-	ourApp  bool      // running is the configured app
-	ours    bool      // ... in the session this process launched (or adopted)
-	idle    bool      // nothing, the backdrop or an idle screen
+	display.Screen      // Ours: the configured app or page, whoever started it
+	ours           bool // ... in the session this process started (or adopted)
 }
 
-// observe reads the device status and works out whose app is on screen.
-func (k *Keeper) observe(ctx context.Context, c Device, t config.Timings) (screen, error) {
+// observe reads what the device shows and works out whose it is.
+func (k *Keeper) observe(ctx context.Context, c display.Session, t config.Timings) (screen, error) {
 	sctx, cancel := context.WithTimeout(ctx, t.CommandTimeout)
-	st, err := c.Status(sctx)
+	sc, err := c.Observe(sctx)
 	cancel()
 	if err != nil {
 		return screen{}, fmt.Errorf("status: %w", err)
 	}
-	// Normally one app runs. If the device lists several, pick
-	// deterministically: ours (the configured app id) if present, else the
-	// first one listed.
-	var s screen
-	if s.running = st.App(k.Cfg.App()); s.running == nil && len(st.Apps) > 0 {
-		s.running = &st.Apps[0]
-	}
-	// Ownership: a session this process launched is ours. Our app with any
-	// other session id belongs to another sender, except at the first check
+	// Ownership: a session this process started is ours. Our app with any
+	// other handle belongs to another sender, except at the first check
 	// after Mantel Cast starts, when it is assumed to be ours from before the
 	// restart and adopted (reloaded once, closed during quiet).
-	s.ourApp = s.running != nil && s.running.AppID == k.Cfg.App()
-	if s.ourApp && !k.checked && k.session == "" {
-		k.session = s.running.SessionID
+	if sc.Ours && !k.checked && k.session == "" {
+		k.session = sc.Handle
 	}
 	k.checked = true
-	s.ours = s.ourApp && k.session != "" && s.running.SessionID == k.session
-	s.idle = s.running == nil || s.running.AppID == cast.AppBackdrop || s.running.IsIdleScreen
-	return s, nil
+	return screen{Screen: sc, ours: sc.Ours && k.session != "" && sc.Handle == k.session}, nil
 }
 
 // closeForQuiet closes our dashboard for the quiet hours; other apps are left alone.
-func (k *Keeper) closeForQuiet(ctx context.Context, c Device, t config.Timings, s screen, why string) error {
+func (k *Keeper) closeForQuiet(ctx context.Context, c display.Session, t config.Timings, s screen, why string) error {
 	if s.ours {
 		// Hand the screen back so the device shows its own dimmed night
 		// clock; the dashboard comes back when the quiet ends.
 		stctx, cancel := context.WithTimeout(ctx, t.CommandTimeout)
-		err := c.Stop(stctx, s.running.SessionID)
+		err := c.Hide(stctx, s.Handle)
 		cancel()
 		if err != nil {
 			return k.appLevel("stop for quiet", err)
@@ -458,20 +495,25 @@ func (k *Keeper) crashLooping(now time.Time, t config.Timings) bool {
 	return true
 }
 
-// pageAnswers probes the page before DashCast casts it and reports why not
-// when it does not answer: DashCast shows "Force loading …" forever for a
-// page it cannot reach, then the device gives up; don't put that on screen.
+// pageAnswers probes the page before the device loads it and reports why
+// not when it does not answer: DashCast shows "Force loading …" forever for
+// a page it cannot reach, then the device gives up, and a kiosk browser shows
+// its error page; don't put that on screen. The probe carries the token, so
+// a rejected token is caught here too, not shown as Mantel's 401 page.
 func (k *Keeper) pageAnswers(ctx context.Context, want string, timeout time.Duration) bool {
 	check := k.Reachable
 	if check == nil {
 		check = reachable
 	}
 	rctx, cancel := context.WithTimeout(ctx, timeout)
-	err := check(rctx, stripQuery(want)) // no token: a 401 still proves it is up
+	err := check(rctx, want)
 	cancel()
+	var hs *statusError
 	switch {
 	case err == nil:
 		return true
+	case errors.As(err, &hs):
+		k.report("not casting: %s: %v", Redact(want), err)
 	case certErr(err):
 		k.report("not casting: %s: bad certificate (%v); the device would refuse it too", Redact(want), err)
 	default:
@@ -536,16 +578,21 @@ func LocalIP(target string) (string, error) {
 	return conn.LocalAddr().(*net.UDPAddr).IP.String(), nil
 }
 
-// reachable reports whether anything answers HTTP at u. Any status counts
-// (401 without a token, 404 on someone else's site): only "nobody there"
-// is a failure. Certificates are verified like the device will: a page
-// the Hub refuses is not worth casting.
+// reachable reports whether the page at u answers: any 2xx or 3xx (a
+// redirect is not followed). 401/403 mean the token is missing or rejected
+// and other statuses a page that is not there (a statusError either way):
+// casting it would only show an error page. Certificates are verified like
+// the device will: a page the Hub refuses is not worth casting.
 func reachable(ctx context.Context, u string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
 		return err
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := probeClient.Do(req)
 	if err != nil {
 		var ue *url.Error
 		if errors.As(err, &ue) {
@@ -554,54 +601,32 @@ func reachable(ctx context.Context, u string) error {
 		return err
 	}
 	_ = resp.Body.Close()
-	return nil
+	if resp.StatusCode < 400 {
+		return nil
+	}
+	return &statusError{code: resp.StatusCode, token: req.URL.Query().Get("k") != ""}
+}
+
+// statusError is the page answering with an error status.
+type statusError struct {
+	code  int
+	token bool // the probed URL carried ?k=
+}
+
+func (e *statusError) Error() string {
+	switch {
+	case (e.code == http.StatusUnauthorized || e.code == http.StatusForbidden) && e.token:
+		return fmt.Sprintf("Mantel rejected the token (HTTP %d); check \"token\" against Mantel's tokens", e.code)
+	case e.code == http.StatusUnauthorized || e.code == http.StatusForbidden:
+		return fmt.Sprintf("the page needs a token (HTTP %d); set \"token\" in mantel-cast.json", e.code)
+	case e.code == http.StatusMisdirectedRequest:
+		return fmt.Sprintf("Mantel refused this host name (HTTP %d); add it to Mantel's allowed_hosts", e.code)
+	}
+	return fmt.Sprintf("the page answers HTTP %d", e.code)
 }
 
 // certErr reports whether err is a TLS certificate verification failure.
 func certErr(err error) bool {
 	var cv *tls.CertificateVerificationError
 	return errors.As(err, &cv)
-}
-
-// stripQuery drops the query (the access token) from u.
-func stripQuery(u string) string {
-	if p, err := url.Parse(u); err == nil {
-		p.RawQuery = ""
-		return p.String()
-	}
-	return u
-}
-
-// Show puts the dashboard on screen: DashCast loads the URL; a custom
-// receiver app is simply launched (its own page is the dashboard).
-// It returns the session id of the app now showing it.
-func Show(ctx context.Context, c Device, cfg config.Cast, url string) (string, error) {
-	if cfg.DashCast() {
-		// force=true navigates the receiver itself to the page instead of an
-		// iframe, which lets plain-http LAN URLs load. It also means DashCast's
-		// own script is gone afterwards, so a second load message to a running
-		// session is silently dropped: stop it and start a fresh one.
-		st, err := c.Status(ctx)
-		if err != nil {
-			return "", err
-		}
-		if a := st.App(cast.AppDashCast); a != nil {
-			if err := c.Stop(ctx, a.SessionID); err != nil {
-				return "", fmt.Errorf("stop old session: %w", err)
-			}
-			if _, err := c.Launch(ctx, cast.AppDashCast); err != nil {
-				return "", err
-			}
-		}
-		a, err := c.LoadURL(ctx, url, true, cfg.Reload)
-		if err != nil {
-			return "", err
-		}
-		return a.SessionID, nil
-	}
-	a, err := c.Launch(ctx, cfg.App())
-	if err != nil {
-		return "", err
-	}
-	return a.SessionID, nil
 }

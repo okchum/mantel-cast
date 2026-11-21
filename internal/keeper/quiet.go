@@ -6,17 +6,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/okchum/mantel-cast/internal/cast"
 	"github.com/okchum/mantel-cast/internal/config"
+	"github.com/okchum/mantel-cast/internal/display"
 	"github.com/okchum/mantel-kit/conf"
 )
 
 // QuietInputs are the signals Decide weighs.
 type QuietInputs struct {
-	Phone *Asleep         // nil: no phone reports
-	Hub   *cast.NightMode // nil: unknown
-	Hours string          // cast.quiet_hours
-	Loc   *time.Location  // zone for Hours (and Hub windows without a zone)
+	Phone *Asleep            // nil: no phone reports
+	Hub   *display.NightMode // nil: unknown
+	Hours string             // cast.quiet_hours
+	Loc   *time.Location     // zone for Hours (and Hub windows without a zone)
 	// A sleep report counts for SleepTTL: a phone that never says "awake"
 	// (flat battery, automation deleted) must not keep the screen dark.
 	// Reports newer than PhoneKnownFor mean "a phone is reporting": its
@@ -142,7 +142,7 @@ func (k *Keeper) quietNow(ctx context.Context, now time.Time) (bool, string) {
 // hubNight reads the device's night mode, at most every night_mode_refresh,
 // falling back to the last good reading for night_mode_stale_for so a
 // network blip at 2am does not end the night.
-func (k *Keeper) hubNight(ctx context.Context, now time.Time) *cast.NightMode {
+func (k *Keeper) hubNight(ctx context.Context, now time.Time) *display.NightMode {
 	if k.host == "" {
 		return nil
 	}
@@ -152,7 +152,11 @@ func (k *Keeper) hubNight(ctx context.Context, now time.Time) *cast.NightMode {
 	}
 	fetch := k.NightMode
 	if fetch == nil {
-		fetch = cast.FetchNightMode
+		nm, ok := k.sess.(display.NightModer)
+		if !ok {
+			return nil // the device has no night mode of its own
+		}
+		fetch = func(ctx context.Context, _ string) (*display.NightMode, error) { return nm.NightMode(ctx) }
 	}
 	n, err := fetch(ctx, k.host)
 	if err == nil {

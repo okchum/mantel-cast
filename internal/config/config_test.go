@@ -43,6 +43,26 @@ func TestCastNormalize(t *testing.T) {
 	}
 }
 
+func TestCastNormalizeDrivers(t *testing.T) {
+	c := Cast{}
+	if err := c.Normalize(); err != nil || c.Driver != DriverCast {
+		t.Fatalf("default driver: %+v %v", c, err)
+	}
+	c = Cast{Driver: DriverFully, Host: "10.0.0.20", Password: "pw"}
+	if err := c.Normalize(); err != nil || c.Driver != DriverFully {
+		t.Fatalf("fully: %+v %v", c, err)
+	}
+	// All day is 00:00-24:00, and the error for an empty window says so.
+	c = Cast{QuietHours: "00:00-24:00"}
+	if err := c.Normalize(); err != nil {
+		t.Fatalf("all day: %v", err)
+	}
+	c = Cast{QuietHours: "00:00-00:00"}
+	if err := c.Normalize(); err == nil || !strings.Contains(err.Error(), "00:00-24:00") {
+		t.Fatalf("empty window: %v", err)
+	}
+}
+
 func TestCastTimings(t *testing.T) {
 	c := Cast{}
 	if c.Timings() != DefaultTimings {
@@ -76,6 +96,10 @@ func TestCastNormalizeRejects(t *testing.T) {
 		"same start and end":  {QuietHours: "07:30-07:30"},
 		"negative reload":     {Reload: -1},
 		"port out of range":   {Port: 70000},
+		"unknown driver":      {Driver: "airplay"},
+		"fully with app_id":   {Driver: DriverFully, Host: "h", AppID: "ABCD1234"},
+		"fully with reload":   {Driver: DriverFully, Host: "h", Reload: 60},
+		"password for cast":   {Password: "pw"},
 	} {
 		if err := bad.Normalize(); err == nil {
 			t.Errorf("%s: %+v should fail", name, bad)

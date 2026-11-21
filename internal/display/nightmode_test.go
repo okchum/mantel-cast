@@ -1,25 +1,9 @@
-package cast
+package display
 
 import (
-	"strings"
 	"testing"
 	"time"
 )
-
-const eureka = `{"name":"Bedroom Display","timezone":"Pacific/Auckland","night_mode_params":{"device_override_do_not_disturb":0,"do_not_disturb":false,"enabled":true,"led_brightness":1.0,"volume":1.0,"windows":[{"days":[0,1,2,3,4,5,6],"length_hours":8.0,"start_hour":22.0}]}}`
-
-func TestParseNightMode(t *testing.T) {
-	n, err := parseNightMode(strings.NewReader(eureka))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !n.Enabled || n.DoNotDisturb || n.Timezone != "Pacific/Auckland" || len(n.Windows) != 1 || n.Windows[0].String() != "22:00+8h" {
-		t.Fatalf("%+v", n)
-	}
-	if _, err := parseNightMode(strings.NewReader(`{"name":"x"}`)); err == nil {
-		t.Fatal("missing params should fail")
-	}
-}
 
 func TestNightModeActive(t *testing.T) {
 	at := func(day, h, m int) time.Time { return time.Date(2026, 5, day, h, m, 0, 0, time.UTC) } // 2026-05-03 is a Sunday
@@ -79,5 +63,27 @@ func TestNightWindowStringRounds(t *testing.T) {
 	w := NightWindow{StartHour: 22 + 59.0/60, LengthHours: 8}
 	if got := w.String(); got != "22:59+8h" {
 		t.Fatalf("String() = %q", got)
+	}
+}
+
+func TestNightModeActiveBounds(t *testing.T) {
+	at := time.Date(2026, 5, 4, 3, 0, 0, 0, time.UTC)
+	// A device reporting nonsense must not stall the check: a huge length
+	// is capped at a week, a start outside the day is ignored.
+	n := &NightMode{Windows: []NightWindow{{StartHour: 22, LengthHours: 1e300}}}
+	done := make(chan bool)
+	go func() { ok, _ := n.Active(at); done <- ok }()
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Error("capped window should still cover 03:00")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Active did not return")
+	}
+	for _, w := range []NightWindow{{StartHour: -1, LengthHours: 8}, {StartHour: 24, LengthHours: 8}, {StartHour: 22, LengthHours: -3}} {
+		if ok, _ := (&NightMode{Windows: []NightWindow{w}}).Active(at); ok {
+			t.Errorf("%+v should be ignored", w)
+		}
 	}
 }

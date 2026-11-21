@@ -6,74 +6,73 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math"
 	"net"
 	"net/http"
+	"strings"
 	"time"
+
+	"github.com/okchum/mantel-cast/internal/display"
 )
 
-// NightMode is the device's own night mode / do-not-disturb setting, as set
-// in the Google Home app (device settings → Night mode). Read-only, from the
-// local setup API, which answers this field without a Google login.
-type NightMode struct {
-	Enabled      bool          `json:"enabled"`
-	DoNotDisturb bool          `json:"do_not_disturb"`
-	Windows      []NightWindow `json:"windows"`
-	Timezone     string        `json:"-"` // the device's zone, from the same reply
-}
+// The device's local setup API (https on 8443) answers a few eureka_info
+// fields without a Google login: the device name, its UUID, the time zone and
+// the night mode settings made in the Google Home app.
 
-// NightWindow starts at StartHour (local, fractional) on each listed day and
-// lasts LengthHours, possibly past midnight.
-type NightWindow struct {
-	// Days uses 0 = Sunday … 6 = Saturday (like time.Weekday). The default
-	// schedule lists every day, so this only matters for custom ones.
-	Days        []int   `json:"days"`
-	StartHour   float64 `json:"start_hour"`
-	LengthHours float64 `json:"length_hours"`
-}
-
-// nightModeClient is shared so repeated reads can reuse a kept-alive TLS
+// setupClient is shared so repeated reads can reuse a kept-alive TLS
 // connection instead of a fresh handshake each time. The device serves a
-// self-signed certificate; this is a LAN read of a setting, nothing secret
+// self-signed certificate; this is a LAN read of settings, nothing secret
 // is sent.
-var nightModeClient = &http.Client{Transport: &http.Transport{
+var setupClient = &http.Client{Transport: &http.Transport{
 	TLSClientConfig:     &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}, //nolint:gosec // see above
 	MaxIdleConnsPerHost: 1,
 	IdleConnTimeout:     10 * time.Minute,
 	TLSHandshakeTimeout: 5 * time.Second,
 }}
 
-// FetchNightMode asks the device at host for its night mode settings
-// (within 5 seconds unless ctx ends sooner).
-func FetchNightMode(ctx context.Context, host string) (*NightMode, error) {
+// setupPort is where eureka_info is served; a var for tests.
+var setupPort = "8443"
+
+// eurekaInfo GETs /setup/eureka_info?params=… from the device at host
+// (within 5 seconds unless ctx ends sooner) and decodes it into v.
+func eurekaInfo(ctx context.Context, host, params string, v any) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	u := "https://" + net.JoinHostPort(host, "8443") + "/setup/eureka_info?params=night_mode_params,timezone"
+	u := "https://" + net.JoinHostPort(host, setupPort) + "/setup/eureka_info?params=" + params
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	resp, err := nightModeClient.Do(req)
+	resp, err := setupClient.Do(req)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("eureka_info: HTTP %d", resp.StatusCode)
+		return fmt.Errorf("eureka_info: HTTP %d", resp.StatusCode)
 	}
-	n, err := parseNightMode(io.LimitReader(resp.Body, 1<<20))
+	err = json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(v)
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20)) // let the connection be reused
-	return n, err
+	if err != nil {
+		return fmt.Errorf("eureka_info: %w", err)
+	}
+	return nil
 }
 
-func parseNightMode(r io.Reader) (*NightMode, error) {
-	var v struct {
-		NightMode *NightMode `json:"night_mode_params"`
-		Timezone  string     `json:"timezone"`
+// FetchNightMode asks the device at host for its night mode settings.
+func FetchNightMode(ctx context.Context, host string) (*display.NightMode, error) {
+	var v nightReply
+	if err := eurekaInfo(ctx, host, "night_mode_params,timezone", &v); err != nil {
+		return nil, err
 	}
-	if err := json.NewDecoder(r).Decode(&v); err != nil {
-		return nil, fmt.Errorf("eureka_info: %w", err)
-	}
+	return v.nightMode()
+}
+
+type nightReply struct {
+	NightMode *display.NightMode `json:"night_mode_params"`
+	Timezone  string             `json:"timezone"`
+}
+
+func (v nightReply) nightMode() (*display.NightMode, error) {
 	if v.NightMode == nil {
 		return nil, fmt.Errorf("eureka_info: no night_mode_params (not a display device?)")
 	}
@@ -81,49 +80,26 @@ func parseNightMode(r io.Reader) (*NightMode, error) {
 	return v.NightMode, nil
 }
 
-// Active reports whether t falls inside one of the windows (whether or not
-// night mode is enabled), and which one.
-func (n *NightMode) Active(t time.Time) (bool, NightWindow) {
-	for _, w := range n.Windows {
-		if w.LengthHours <= 0 {
-			continue
-		}
-		// A window that started on an earlier day may still be running.
-		back := int(w.StartHour+w.LengthHours) / 24
-		for off := 0; off <= back; off++ {
-			d := time.Date(t.Year(), t.Month(), t.Day()-off, 0, 0, 0, 0, t.Location())
-			if !hasDay(w.Days, int(d.Weekday())) {
-				continue
-			}
-			// Wall-clock times in t's zone, so a DST change that night does
-			// not shift the window by an hour.
-			from := int(math.Round(w.StartHour * 60))
-			to := from + int(math.Round(w.LengthHours*60))
-			start := time.Date(d.Year(), d.Month(), d.Day(), 0, from, 0, 0, d.Location())
-			end := time.Date(d.Year(), d.Month(), d.Day(), 0, to, 0, 0, d.Location())
-			if !t.Before(start) && t.Before(end) {
-				return true, w
-			}
-		}
+func parseNightMode(r io.Reader) (*display.NightMode, error) {
+	var v nightReply
+	if err := json.NewDecoder(r).Decode(&v); err != nil {
+		return nil, fmt.Errorf("eureka_info: %w", err)
 	}
-	return false, NightWindow{}
+	return v.nightMode()
 }
 
-func hasDay(days []int, d int) bool {
-	if len(days) == 0 {
-		return true
+// Identify asks the device at host for its name and UUID (the UUID without
+// dashes, as mDNS discovery reports it).
+func Identify(ctx context.Context, host string) (display.Device, error) {
+	var v struct {
+		Name string `json:"name"`
+		UDN  string `json:"ssdp_udn"`
 	}
-	for _, x := range days {
-		if x == d {
-			return true
-		}
+	if err := eurekaInfo(ctx, host, "name,ssdp_udn", &v); err != nil {
+		return display.Device{}, err
 	}
-	return false
-}
-
-// String is "22:00 起 8 小时" style, for logs.
-func (w NightWindow) String() string {
-	// Rounded to the minute like Active, so the log shows the real start.
-	mins := int(math.Round(w.StartHour * 60))
-	return fmt.Sprintf("%02d:%02d+%gh", mins/60, mins%60, w.LengthHours)
+	if v.Name == "" && v.UDN == "" {
+		return display.Device{}, fmt.Errorf("eureka_info: no name or ssdp_udn")
+	}
+	return display.Device{Name: v.Name, ID: strings.ReplaceAll(strings.ToLower(v.UDN), "-", ""), Host: host}, nil
 }

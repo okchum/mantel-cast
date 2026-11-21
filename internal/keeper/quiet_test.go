@@ -10,13 +10,14 @@ import (
 
 	"github.com/okchum/mantel-cast/internal/cast"
 	"github.com/okchum/mantel-cast/internal/config"
+	"github.com/okchum/mantel-cast/internal/display"
 )
 
 func TestDecide(t *testing.T) {
 	now := time.Date(2026, 5, 4, 23, 0, 0, 0, time.UTC) // Monday 23:00
-	night := &cast.NightMode{Enabled: true, Windows: []cast.NightWindow{{StartHour: 22, LengthHours: 8}}}
-	off := &cast.NightMode{Enabled: false, Windows: night.Windows}
-	dnd := &cast.NightMode{DoNotDisturb: true}
+	night := &display.NightMode{Enabled: true, Windows: []display.NightWindow{{StartHour: 22, LengthHours: 8}}}
+	off := &display.NightMode{Enabled: false, Windows: night.Windows}
+	dnd := &display.NightMode{DoNotDisturb: true}
 	asleep := &Asleep{On: true, At: now.Add(-time.Hour)}
 	awake := &Asleep{On: false, At: now.Add(-3 * time.Hour)}
 	cases := []struct {
@@ -37,7 +38,7 @@ func TestDecide(t *testing.T) {
 		{"old phone falls back to hours", "auto", QuietInputs{Phone: &Asleep{At: now.Add(-48 * time.Hour)}, Hours: "22:30-07:00"}, true, "quiet hours"},
 		{"hours fallback", "auto", QuietInputs{Hours: "22:30-07:00"}, true, "quiet hours 22:30-07:00"},
 		{"hours mode ignores hub", "hours", QuietInputs{Hub: dnd}, false, ""},
-		{"off", "off", QuietInputs{Hub: dnd, Hours: "00:00-23:59"}, false, ""},
+		{"off", "off", QuietInputs{Hub: dnd, Hours: "00:00-24:00"}, false, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -87,7 +88,7 @@ func TestQuietClosesAndReturns(t *testing.T) {
 
 func TestQuietLeavesOtherApps(t *testing.T) {
 	k, d, _ := newKeeper("http://10.0.0.5:8080/")
-	k.Cfg.QuietHours = "00:00-23:59"
+	k.Cfg.QuietHours = "00:00-24:00"
 	d.apps = []cast.App{{AppID: "CC1AD845", DisplayName: "Spotify", SessionID: "x"}}
 	mustCheck(t, k, d)
 	if d.stopped != 0 || len(d.apps) != 1 {
@@ -98,11 +99,11 @@ func TestQuietLeavesOtherApps(t *testing.T) {
 func TestHubReadingCached(t *testing.T) {
 	k, _, clk := newKeeper("http://x/")
 	fail := false
-	k.NightMode = func(context.Context, string) (*cast.NightMode, error) {
+	k.NightMode = func(context.Context, string) (*display.NightMode, error) {
 		if fail {
 			return nil, errors.New("timeout")
 		}
-		return &cast.NightMode{DoNotDisturb: true}, nil
+		return &display.NightMode{DoNotDisturb: true}, nil
 	}
 	if k.hubNight(context.Background(), clk.t) == nil {
 		t.Fatal("no reading")
@@ -123,12 +124,12 @@ func TestNightModeRefreshAndRecovery(t *testing.T) {
 	k, _, clk := newKeeper("http://x/")
 	fetches := 0
 	var fail error
-	k.NightMode = func(context.Context, string) (*cast.NightMode, error) {
+	k.NightMode = func(context.Context, string) (*display.NightMode, error) {
 		fetches++
 		if fail != nil {
 			return nil, fail
 		}
-		return &cast.NightMode{}, nil
+		return &display.NightMode{}, nil
 	}
 	ctx := context.Background()
 	k.hubNight(ctx, clk.t)
@@ -191,9 +192,9 @@ func TestQuietReadsRunTogether(t *testing.T) {
 		}
 	}
 	k.Phone = func(context.Context) (*Asleep, error) { close(phoneIn); return nil, wait(hubIn) }
-	k.NightMode = func(context.Context, string) (*cast.NightMode, error) {
+	k.NightMode = func(context.Context, string) (*display.NightMode, error) {
 		close(hubIn)
-		return &cast.NightMode{}, wait(phoneIn)
+		return &display.NightMode{}, wait(phoneIn)
 	}
 	k.quietNow(context.Background(), clk.t)
 	if k.phoneErr != "" || k.hubErr != "" {
@@ -211,7 +212,7 @@ func TestDecideCustomTTLs(t *testing.T) {
 		t.Fatal("sleep_report_ttl 4h should expire a 5h-old report")
 	}
 	awake := &Asleep{At: now.Add(-3 * time.Hour)}
-	if q, _ := Decide("auto", QuietInputs{Phone: awake, Hours: "00:00-23:59", Loc: time.UTC, PhoneKnownFor: 2 * time.Hour}, now); !q {
+	if q, _ := Decide("auto", QuietInputs{Phone: awake, Hours: "00:00-24:00", Loc: time.UTC, PhoneKnownFor: 2 * time.Hour}, now); !q {
 		t.Fatal("phone_known_for 2h: a 3h-old awake report no longer beats quiet_hours")
 	}
 }

@@ -169,6 +169,14 @@ func TestMantelKeysCoverMantelConfig(t *testing.T) {
 			t.Errorf("mantelKeys lacks Mantel's %q", key)
 		}
 	}
+	// And the other way: a key Mantel dropped or renamed would otherwise
+	// keep marking files as Mantel configs (a mantel-cast.json with a typo
+	// for it then reads as one).
+	for _, key := range mantelKeys {
+		if !slices.Contains(keys, key) {
+			t.Errorf("mantelKeys has %q, which Mantel's Config no longer has", key)
+		}
+	}
 }
 
 // structJSONKeys lists the json tag names of the fields of struct typeName

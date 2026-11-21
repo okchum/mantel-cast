@@ -1,5 +1,5 @@
 // Package config holds Mantel Cast's settings: where the Mantel page is, the token
-// to open it with, and which Cast device to keep on it.
+// to open it with, and which device (Cast, or a kiosk browser) to keep on it.
 package config
 
 import (
@@ -13,17 +13,28 @@ import (
 // test checks); copied so config does not depend on the protocol package.
 const AppDashCast = "84912283"
 
+// Drivers: the screen technologies cast.driver can name.
+const (
+	DriverCast  = "cast"  // Google Cast: Nest Hub, Chromecast, Cast TVs (default)
+	DriverFully = "fully" // Fully Kiosk Browser's Remote Admin (Android tablets)
+)
+
 // Duration is a time.Duration that unmarshals from strings like "30s" or "5m".
 type Duration = conf.Duration
 
 type Cast struct {
 	// Enabled = false keeps "mantel-cast run" idle (Mantel's config.json may carry
 	// this section for a box that does not run Mantel Cast). Absent = enabled.
-	Enabled       *bool    `json:"enabled"`
-	Device        string   `json:"device"` // name, UUID or name/model substring, matched case-insensitively
-	Host          string   `json:"host"`   // skip discovery when set
-	Port          int      `json:"port"`
-	AppID         string   `json:"app_id"` // default DashCast; set to your Custom Receiver id to use one
+	Enabled *bool `json:"enabled"`
+	// Driver is the screen technology: "cast" (default) or "fully".
+	Driver string `json:"driver"`
+	Device string `json:"device"` // name, UUID or name/model substring, matched case-insensitively
+	Host   string `json:"host"`   // skip discovery when set (fully: required, it cannot be discovered)
+	Port   int    `json:"port"`
+	AppID  string `json:"app_id"` // cast: default DashCast; set to your Custom Receiver id to use one
+	// Password is Fully's Remote Admin password ("$ENV_NAME" reads the
+	// environment, expanded by whoever loads the config).
+	Password      string   `json:"password"`
 	CheckInterval Duration `json:"check_interval"`
 	// TakeOver re-casts even when another app (YouTube, Spotify, ...) is playing.
 	// Default false: only re-cast when the device sits on its idle/ambient screen.
@@ -129,6 +140,23 @@ func (c *Cast) IsEnabled() bool { return c.Enabled == nil || *c.Enabled }
 // Normalize fills defaults and checks the cast section; Mantel Cast uses it on
 // its own config too.
 func (c *Cast) Normalize() error {
+	switch c.Driver {
+	case "":
+		c.Driver = DriverCast
+	case DriverCast, DriverFully:
+	default:
+		return fmt.Errorf("cast.driver must be %q or %q, not %q", DriverCast, DriverFully, c.Driver)
+	}
+	if c.Driver == DriverFully {
+		if c.AppID != "" && c.AppID != AppDashCast {
+			return fmt.Errorf("cast.app_id is for the cast driver, not %q", DriverFully)
+		}
+		if c.Reload != 0 {
+			return fmt.Errorf("cast.reload_seconds is for the cast driver (DashCast); set Fully's own auto reload instead")
+		}
+	} else if c.Password != "" {
+		return fmt.Errorf("cast.password is for the %q driver", DriverFully)
+	}
 	c.AppID = c.App()
 	switch c.Quiet {
 	case "":
@@ -143,7 +171,7 @@ func (c *Cast) Normalize() error {
 			return fmt.Errorf("cast.quiet_hours: %w", err)
 		}
 		if start == end {
-			return fmt.Errorf("cast.quiet_hours %q starts and ends at the same time, so it never applies (all day: \"00:00-23:59\"; never: leave it empty)", c.QuietHours)
+			return fmt.Errorf("cast.quiet_hours %q starts and ends at the same time, so it never applies (all day: \"00:00-24:00\"; never: leave it empty)", c.QuietHours)
 		}
 	}
 	if c.Port < 0 || c.Port > 65535 {
